@@ -50,8 +50,8 @@ android {
         applicationId = "com.example.ytplayer"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 4
+        versionName = "2.2"
         ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a") }
     }
 
@@ -294,7 +294,10 @@ package com.example.ytplayer
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
@@ -340,12 +343,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.guava.await
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.lang.reflect.Modifier
 import java.net.URL
 import kotlin.math.abs
 
@@ -359,7 +364,7 @@ class MainActivity : Activity() {
     // ----- 데이터 -----
     private val songs = mutableListOf<Song>()
     private val playlists = linkedMapOf<String, MutableList<String>>()
-    private val progress = HashMap<String, Int>()
+    private val progress = HashMap<String, Int>() // 받은 용량(KB)
     private val thumbCache = HashMap<String, Bitmap>()
     private var tab = 0
     private var openPlaylist: String? = null
@@ -368,6 +373,15 @@ class MainActivity : Activity() {
     private var sleepRunnable: Runnable? = null
     private var seeking = false
     private val speeds = listOf(0.75f, 1f, 1.25f, 1.5f, 2f)
+
+    // 유튜브 접속 방식 (extractor-args, 포맷) - 앞에서부터 차례로 시도
+    private val attempts = listOf(
+        Pair("", "bestaudio/best"),
+        Pair("youtube:player_client=android_vr", "bestaudio/best"),
+        Pair("youtube:player_client=web_embedded,web,tv", "bestaudio/best"),
+        Pair("youtube:player_client=mweb", "bestaudio/best"),
+        Pair("", "best")
+    )
 
     private val prefs by lazy { getSharedPreferences("library", MODE_PRIVATE) }
     private val musicDir: File by lazy {
@@ -438,6 +452,7 @@ class MainActivity : Activity() {
         engineReady = scope.async(Dispatchers.IO) {
             YoutubeDL.getInstance().init(application)
             FFmpeg.getInstance().init(application)
+            updateYtDlp()
             Unit
         }
 
@@ -461,6 +476,48 @@ class MainActivity : Activity() {
         controller?.release()
         scope.cancel()
         super.onDestroy()
+    }
+
+    // yt-dlp 엔진을 최신(nightly)으로 업데이트한다.
+    // 라이브러리 버전이 달라도 컴파일되도록 리플렉션으로 호출한다. 실패해도 무시.
+    private fun updateYtDlp() {
+        try {
+            val yd = YoutubeDL.getInstance()
+            val m = yd.javaClass.methods
+                .filter { it.name == "updateYoutubeDL" }
+                .maxByOrNull { it.parameterTypes.size } ?: return
+            val params = m.parameterTypes
+            val args = arrayOfNulls<Any>(params.size)
+            args[0] = application
+            if (params.size > 1) {
+                val t = params[1]
+                var chosen: Any? = null
+                val enums = t.enumConstants
+                if (enums != null) {
+                    chosen = enums.firstOrNull { it.toString().equals("NIGHTLY", true) }
+                        ?: enums.firstOrNull()
+                }
+                if (chosen == null) {
+                    for (f in t.fields) {
+                        if (Modifier.isStatic(f.modifiers) && f.name.contains("NIGHTLY", true)) {
+                            chosen = f.get(null)
+                            break
+                        }
+                    }
+                }
+                if (chosen == null) {
+                    for (c in t.declaredClasses) {
+                        if (c.simpleName.contains("NIGHTLY", true)) {
+                            chosen = c.getField("INSTANCE").get(null)
+                            break
+                        }
+                    }
+                }
+                args[1] = chosen
+            }
+            m.invoke(yd, *args)
+        } catch (ignored: Exception) {
+        }
     }
 
     // =====================================================
@@ -648,8 +705,8 @@ class MainActivity : Activity() {
             thumbTintList = ColorStateList.valueOf(accent)
         }
         seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (fromUser) timeNow.text = fmt(progress.toLong())
+            override fun onProgressChanged(sb: SeekBar?, value: Int, fromUser: Boolean) {
+                if (fromUser) timeNow.text = fmt(value.toLong())
             }
 
             override fun onStartTrackingTouch(sb: SeekBar?) {
@@ -781,8 +838,9 @@ class MainActivity : Activity() {
             setSingleLine()
             ellipsize = TextUtils.TruncateAt.END
         }
+        val mb = String.format("%.1f", (progress[s.id] ?: 0) / 1024.0)
         val subText = when (s.status) {
-            Song.DOWNLOADING -> "다운로드 중 ${progress[s.id] ?: 0}%"
+            Song.DOWNLOADING -> "다운로드 중 · ${mb}MB"
             Song.FAILED -> "실패 · 탭해서 재시도"
             else -> if (playing) "재생 중" else "저장됨"
         }
@@ -971,6 +1029,19 @@ class MainActivity : Activity() {
             .show()
     }
 
+    private fun showError(msg: String) {
+        AlertDialog.Builder(this)
+            .setTitle("다운로드 실패")
+            .setMessage(msg.take(3000))
+            .setPositiveButton("확인", null)
+            .setNeutralButton("복사") { _, _ ->
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("error", msg))
+                toast("오류 내용을 복사했어요")
+            }
+            .show()
+    }
+
     private fun addToPlaylist(s: Song) {
         val items = mutableListOf<Pair<String, () -> Unit>>()
         for (n in playlists.keys.toList()) {
@@ -1049,53 +1120,100 @@ class MainActivity : Activity() {
         startDownload(s, n.isEmpty())
     }
 
+    private fun withClient(req: YoutubeDLRequest, arg: String): YoutubeDLRequest {
+        if (arg.isNotEmpty()) req.addOption("--extractor-args", arg)
+        return req
+    }
+
     private fun startDownload(s: Song, useInfoTitle: Boolean) {
         s.status = Song.DOWNLOADING
         progress[s.id] = 0
         refresh()
 
         scope.launch {
+            var failMsg: String? = null
+
+            // 받은 파일 크기를 주기적으로 읽어서 진행 상황 표시
+            val poll = launch {
+                while (true) {
+                    delay(700)
+                    val bytes = (musicDir.listFiles() ?: emptyArray<File>())
+                        .filter { it.name.startsWith(s.id) }
+                        .sumOf { it.length() }
+                    progress[s.id] = (bytes / 1024).toInt()
+                    listAdapter.notifyDataSetChanged()
+                }
+            }
+
             try {
                 engineReady.await()
-                withContext(Dispatchers.IO) {
-                    // 1) 제목, 썸네일 정보
-                    val infoReq = YoutubeDLRequest(s.url)
-                    infoReq.addOption("--no-playlist")
-                    val info = YoutubeDL.getInstance().getInfo(infoReq)
-                    val t = info.title
-                    if (useInfoTitle && !t.isNullOrBlank()) s.title = t
-                    val thumbUrl = info.thumbnail
-                    if (!thumbUrl.isNullOrEmpty()) {
-                        try {
-                            URL(thumbUrl).openStream().use { inp ->
-                                thumbFile(s).outputStream().use { out -> inp.copyTo(out) }
-                            }
-                            s.thumb = thumbFile(s).absolutePath
-                        } catch (ignored: Exception) {
-                        }
-                    }
+                val errors = StringBuilder()
+                var ok = false
 
-                    // 2) MP3 다운로드
-                    val req = YoutubeDLRequest(s.url)
-                    req.addOption("--no-playlist")
-                    req.addOption("-x")
-                    req.addOption("--audio-format", "mp3")
-                    req.addOption("--audio-quality", "0")
-                    req.addOption("-o", File(musicDir, s.id + ".%(ext)s").absolutePath)
-                    YoutubeDL.getInstance().execute(req, s.id) { p, _, _ ->
-                        ui.post {
-                            progress[s.id] = p.toInt()
-                            listAdapter.notifyDataSetChanged()
+                withContext(Dispatchers.IO) {
+                    for ((idx, attempt) in attempts.withIndex()) {
+                        val arg = attempt.first
+                        val fmtArg = attempt.second
+                        try {
+                            // 1) 제목, 썸네일 정보
+                            val infoReq = withClient(YoutubeDLRequest(s.url), arg)
+                            infoReq.addOption("--no-playlist")
+                            infoReq.addOption("-f", fmtArg)
+                            val info = YoutubeDL.getInstance().getInfo(infoReq)
+                            val t = info.title
+                            if (useInfoTitle && !t.isNullOrBlank()) s.title = t
+                            val thumbUrl = info.thumbnail
+                            if (!thumbUrl.isNullOrEmpty()) {
+                                try {
+                                    URL(thumbUrl).openStream().use { inp ->
+                                        thumbFile(s).outputStream().use { out -> inp.copyTo(out) }
+                                    }
+                                    s.thumb = thumbFile(s).absolutePath
+                                } catch (ignored: Exception) {
+                                }
+                            }
+
+                            // 2) MP3 다운로드
+                            val req = withClient(YoutubeDLRequest(s.url), arg)
+                            req.addOption("--no-playlist")
+                            req.addOption("-f", fmtArg)
+                            req.addOption("-x")
+                            req.addOption("--audio-format", "mp3")
+                            req.addOption("--audio-quality", "0")
+                            req.addOption("--retries", "3")
+                            req.addOption("-o", File(musicDir, s.id + ".%(ext)s").absolutePath)
+                            YoutubeDL.getInstance().execute(req)
+
+                            if (audioFile(s).exists()) {
+                                ok = true
+                                break
+                            }
+                            throw IllegalStateException("MP3 파일이 만들어지지 않았어요")
+                        } catch (e: Exception) {
+                            val label = if (arg.isEmpty()) "기본" else arg.substringAfter("=")
+                            errors.append("[시도 ${idx + 1}: $label / $fmtArg]\n")
+                                .append(e.message ?: e.toString())
+                                .append("\n\n")
                         }
                     }
                 }
-                if (!audioFile(s).exists()) throw IllegalStateException("MP3 파일이 만들어지지 않았어요")
-                thumbCache.remove(s.id)
-                s.status = Song.READY
-                toast("저장 완료: ${s.title}")
+
+                if (ok) {
+                    thumbCache.remove(s.id)
+                    s.status = Song.READY
+                    toast("저장 완료: ${s.title}")
+                } else {
+                    failMsg = errors.toString()
+                }
             } catch (e: Exception) {
+                failMsg = e.message ?: e.toString()
+            }
+
+            poll.cancel()
+
+            if (failMsg != null) {
                 s.status = Song.FAILED
-                toast("다운로드 실패: ${e.message}")
+                showError(failMsg)
             }
             progress.remove(s.id)
             save()
@@ -1316,7 +1434,7 @@ class MainActivity : Activity() {
 
     // 유튜브 앱에서 "공유 → YT Player"로 보내면 링크 자동 입력
     private fun handleIntent(i: Intent?) {
-        if (i?.action != Intent.ACTION_SEND) return
+        if (i == null || i.action != Intent.ACTION_SEND) return
         val text = i.getStringExtra(Intent.EXTRA_TEXT) ?: return
         val link = Regex("https?://\\S+").find(text)?.value ?: text
         form.visibility = View.VISIBLE
